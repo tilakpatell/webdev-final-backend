@@ -745,4 +745,45 @@ async def get_performance_metrics(user_id: str, timeframe: str = "1M"):
     except Exception as e:
         print(f"Error fetching performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+      
 
+@router.get("/transactions/{user_id}")
+async def get_transactions(user_id: str):
+    try:
+        user_trades = list(trades.find(
+            {"user_id": ObjectId(user_id)},
+            sort=[("timestamp", -1)],
+            limit=10
+        ))
+        
+        formatted_trades = []
+        for trade in user_trades:
+            # Base trade information
+            formatted_trade = {
+                "id": str(trade["_id"]),
+                "type": trade.get("trade_type", ""),
+                "symbol": trade.get("symbol", ""),
+                "amount": float(trade.get("total_cost", 0)),
+                "quantity": int(trade.get("quantity", 0)),
+                "date": trade.get("timestamp").strftime("%Y-%m-%d") if isinstance(trade.get("timestamp"), datetime) else None
+            }
+
+            if "option_type" in trade:
+                formatted_trade.update({
+                    "option_type": trade.get("option_type"),
+                    "strike": float(trade.get("strike", 0)),
+                    "premium": float(trade.get("premium", 0)),
+                    "expiration": trade.get("expiration"),
+                    "price": float(trade.get("premium", 0)) 
+                })
+            else:
+                # For stock trades
+                formatted_trade["price"] = float(trade.get("price", 0))
+
+            formatted_trades.append(formatted_trade)
+            
+        return formatted_trades
+        
+    except Exception as e:
+        print(f"Error fetching transactions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

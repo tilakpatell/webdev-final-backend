@@ -78,3 +78,23 @@ class PortfolioSummary(BaseModel):
 class PerformanceHistory(BaseModel):
     dates: List[str]
     values: List[float]
+
+
+class StockAnalysisRequest(BaseModel):
+    symbol: str
+    price: float
+    change: float
+    percentChange: float
+    metrics: Optional[Dict[str, float]] = None
+    timeframe: Optional[str] = "short-term"
+
+class MarketAnalysisRequest(BaseModel):
+    indices: Dict[str, float]
+    trends: List[str]
+    timeframe: Optional[str] = "short-term"
+
+class PortfolioAnalysisRequest(BaseModel):
+    holdings: List[Dict[str, float]]
+    total_value: float
+    cash_position: float
+    risk_profile: Optional[str] = "moderate"
