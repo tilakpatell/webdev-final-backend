@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes.auth_routes import router as auth_router
-from routes.finance_routes import router as finance_router
-from routes.chatbot_routes import router as chatbot_router
-from database import test_connection
+from .routes.auth_routes import router as auth_router
+from .routes.finance_routes import router as finance_router
+from .routes.chatbot_routes import router as chatbot_router
+from .database import test_connection
 from contextlib import asynccontextmanager
 
 @asynccontextmanager

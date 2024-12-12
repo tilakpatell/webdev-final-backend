@@ -98,3 +98,9 @@ class PortfolioAnalysisRequest(BaseModel):
     total_value: float
     cash_position: float
     risk_profile: Optional[str] = "moderate"
+
+class StockTrade(BaseModel):
+    symbol: str
+    type: str  
+    quantity: int
+    price: float

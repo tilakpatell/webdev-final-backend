@@ -1,19 +1,18 @@
 from fastapi import APIRouter, HTTPException, Query
+from backend_files.services.chatbot import ChatGPT
+from ..database import users, trades
 import requests
-from database import users, trades
 import os
+from dotenv import load_dotenv
 from bson import ObjectId
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from typing import Optional, Literal, List
+from typing import Dict, List
 from cachetools import TTLCache
 import random
 import yfinance as yf
-from backend_files.schemas import OptionTradeRequest, Position, PortfolioData, SectorData, PortfolioSummary
+from ..schemas import OptionTradeRequest, SectorData, PortfolioSummary, StockTrade
 
-# Load environment variables
-load_dotenv()
-
+load_dotenv(verbose=True) 
 router = APIRouter()
 
 SECTOR_COLORS = {
@@ -479,115 +478,59 @@ async def get_options_chain(symbol: str):
       
       
 @router.post("/trade")
-async def execute_option_trade(
-    user_id: str,
-    symbol: str,
-    option_type: Literal["CALL", "PUT"],
-    strike: float,
-    premium: float,
-    expiration: str,
-    trade_type: Literal["BUY", "SELL"],
-    quantity: int
+async def execute_stock_trade(
+    trade: StockTrade,  # Put the body parameter first
+    user_id: str = Query(...)  # Query parameter with default comes after
 ):
     try:
-        # Verify user exists
         user = users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-
-        # Calculate total cost (each contract is for 100 shares)
-        total_cost = premium * 100 * quantity
-
-        # Get user's options and create position key
-        user_options = user.get("options", {})
-        position_key = f"{symbol}-{option_type}-{strike}-{expiration}"
-
-        if trade_type == "BUY":
-            # Check if user has enough cash
+            
+        total_cost = trade.price * trade.quantity
+        
+        if trade.type == "BUY":
             if user["cash"] < total_cost:
                 raise HTTPException(status_code=400, detail="Insufficient funds")
-
-            # Update user's cash and option position
+                
             result = users.update_one(
                 {"_id": ObjectId(user_id)},
                 {
                     "$inc": {
                         "cash": -total_cost,
-                        f"options.{position_key}": quantity
+                        f"portfolio.{trade.symbol}": trade.quantity
                     }
                 }
             )
-
         else:  # SELL
-            # Check if user has enough contracts
-            current_position = user_options.get(position_key, 0)
-            if current_position < quantity:
-                raise HTTPException(status_code=400, detail="Insufficient contracts to sell")
-
-            # Update user's cash and option position
+            current_position = user.get("portfolio", {}).get(trade.symbol, 0)
+            if current_position < trade.quantity:
+                raise HTTPException(status_code=400, detail="Insufficient shares")
+                
             result = users.update_one(
                 {"_id": ObjectId(user_id)},
                 {
                     "$inc": {
                         "cash": total_cost,
-                        f"options.{position_key}": -quantity
+                        f"portfolio.{trade.symbol}": -trade.quantity
                     }
                 }
             )
-
-        # Record the trade
-        trade_record = {
-            "user_id": ObjectId(user_id),
-            "symbol": symbol,
-            "option_type": option_type,
-            "strike": strike,
-            "premium": premium,
-            "expiration": expiration,
-            "trade_type": trade_type,
-            "quantity": quantity,
-            "total_cost": total_cost,
-            "timestamp": datetime.utcnow()
-        }
-        trades.insert_one(trade_record)
-
-        # Get updated portfolio
+            
         updated_user = users.find_one({"_id": ObjectId(user_id)})
-        
-        # Format portfolio response
-        portfolio_response = {
-            "cash": updated_user.get("cash", 0),
-            "positions": [],
-            "options": [],
-            "total_value": updated_user.get("cash", 0)
+        return {
+            "cash": updated_user["cash"],
+            "positions": [
+                {"symbol": k, "quantity": v}
+                for k, v in updated_user.get("portfolio", {}).items()
+                if v > 0
+            ],
+            "total_value": updated_user["cash"]
         }
-
-        # Add stock positions
-        for symbol, qty in updated_user.get("portfolio", {}).items():
-            if qty > 0:
-                portfolio_response["positions"].append({
-                    "symbol": symbol,
-                    "quantity": qty
-                })
-
-        # Add options positions
-        for opt_key, qty in updated_user.get("options", {}).items():
-            if qty > 0:
-                symbol, opt_type, strike, exp = opt_key.split("-")
-                option_position = {
-                    "symbol": symbol,
-                    "option_type": opt_type,
-                    "strike": float(strike),
-                    "expiration": exp,
-                    "quantity": qty
-                }
-                portfolio_response["options"].append(option_position)
-
-        return portfolio_response
-
+            
     except Exception as e:
-        print(f"Trade execution error: {e}")
+        print(f"Trade execution error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/market/overview")
 async def get_market_overview():
@@ -787,3 +730,187 @@ async def get_transactions(user_id: str):
     except Exception as e:
         print(f"Error fetching transactions: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/portfolio/{user_id}/sector-allocation")
+async def get_sector_allocation(user_id: str):
+    try:
+        user = users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        sectors = {}
+        total_value = float(user.get("cash", 0))  # Start with cash
+        sectors["Cash"] = total_value
+
+        portfolio = user.get("portfolio", {})
+
+        for symbol, quantity in portfolio.items():
+            try:
+                if quantity > 0:
+                    quote = await get_stock_quote(symbol)
+                    position_value = float(quantity) * float(quote["price"])
+                    total_value += position_value
+
+                    sector = get_sector_for_symbol(symbol)
+                    sectors[sector] = sectors.get(sector, 0) + position_value
+
+            except Exception as e:
+                print(f"Error processing position for {symbol}: {e}")
+                continue
+
+        sector_allocation = []
+        for sector, value in sectors.items():
+            if total_value > 0:  # Avoid division by zero
+                percentage = (value / total_value) * 100
+                sector_allocation.append({
+                    "sector": sector,
+                    "value": float(value),
+                    "percentage": float(percentage),
+                    "color": SECTOR_COLORS.get(sector, SECTOR_COLORS["Other"])
+                })
+
+        return {
+            "sector_allocation": sorted(sector_allocation, key=lambda x: x["value"], reverse=True),
+            "total_value": float(total_value)
+        }
+
+    except Exception as e:
+        print(f"Error calculating sector allocation: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to calculate sector allocation: {str(e)}"
+        )
+
+
+@router.get("/portfolio/{user_id}/performance")
+async def get_portfolio_performance(user_id: str):
+    try:
+        # Verify user exists
+        user = users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        # Initialize variables with safe defaults
+        total_invested = 0
+        realized_gains = 0
+        unrealized_gains = 0
+        current_value = float(user.get("cash", 0))  # Convert to float for safety
+        
+        # Get portfolio positions
+        portfolio = user.get("portfolio", {})
+        
+        # Calculate current portfolio value and unrealized gains
+        for symbol, quantity in portfolio.items():
+            try:
+                if quantity > 0:  # Only process active positions
+                    quote = await get_stock_quote(symbol)
+                    position_value = float(quantity) * float(quote["price"])
+                    current_value += position_value
+                    
+                    # For now, assume cost basis is initial investment
+                    # You may want to implement a more sophisticated cost basis calculation
+                    unrealized_gains += position_value - (float(quantity) * float(quote["price"]))
+            except Exception as e:
+                print(f"Error processing position for {symbol}: {e}")
+                continue
+        
+        # Calculate total gains
+        total_gain_loss = realized_gains + unrealized_gains
+        
+        # Safe calculation of percentage with check for zero
+        total_gain_loss_percentage = (
+            (total_gain_loss / total_invested * 100)
+            if total_invested and total_invested > 0
+            else 0
+        )
+        
+        return {
+            "total_value": float(current_value),
+            "total_gain_loss": float(total_gain_loss),
+            "total_gain_loss_percentage": float(total_gain_loss_percentage),
+            "realized_gains": float(realized_gains),
+            "unrealized_gains": float(unrealized_gains),
+            "total_invested": float(total_invested)
+        }
+        
+    except Exception as e:
+        print(f"Error calculating portfolio performance: {str(e)}")
+        # Return a more detailed error message
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to calculate portfolio performance: {str(e)}"
+        )
+
+
+@router.get("/insights/{user_id}")
+async def get_portfolio_insights(user_id: str):
+    try:
+        user = users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Get portfolio data
+        portfolio = user.get("portfolio", {})
+        positions = user.get("positions", [])
+        total_value = float(user.get("total_value", 0) or 0)
+        cash = float(user.get("cash", 0) or 0)
+
+        # Format data for ChatGPT
+        prompt = f"""
+        Analyze this investment portfolio and provide insights:
+
+        Total Portfolio Value: ${total_value:,.2f}
+        Cash Position: ${cash:,.2f}
+        
+        Current Positions:
+        {positions}
+
+        Provide a JSON response with the following structure:
+        {{
+            "risk_level": "Low" or "Moderate" or "High",
+            "health_score": number between 0-100,
+            "health_rating": descriptive rating of the health score,
+            "recommendations": [
+                {{
+                    "title": "brief title",
+                    "description": "detailed recommendation"
+                }},
+                ... (up to 3 recommendations)
+            ]
+        }}
+
+        Base the analysis on:
+        - Diversification
+        - Sector allocation
+        - Cash position
+        - Risk exposure
+        - Current market conditions
+        """
+
+        # Get ChatGPT response
+        chatbot = ChatGPT()  # Your ChatGPT service instance
+        response = await chatbot._get_response(prompt, [])
+        
+        # Parse and validate response
+        try:
+            import json
+            insights = json.loads(response)
+            return insights
+        except json.JSONDecodeError:
+            # Fallback response if ChatGPT output isn't valid JSON
+            return {
+                "risk_level": "Moderate",
+                "health_score": 70,
+                "health_rating": "Good",
+                "recommendations": [
+                    {
+                        "title": "Regular Review",
+                        "description": "Schedule periodic portfolio reviews"
+                    }
+                ]
+            }
+
+    except Exception as e:
+        print(f"Error getting portfolio insights: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate portfolio insights")

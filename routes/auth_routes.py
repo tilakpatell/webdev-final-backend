@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, Response, Request
-from fastapi.responses import JSONResponse
-from database import users
-from schemas import UserLogin, UserSignup
+from ..database import users
+from ..schemas import UserLogin, UserSignup
 from bson import ObjectId
 
 
