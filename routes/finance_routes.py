@@ -3,26 +3,122 @@ import requests
 from backend_files.database import users, trades
 import os
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from typing import Dict, Optional
-from time import sleep
+from typing import Optional, Literal
 from cachetools import TTLCache
+import random
+from backend_files.schemas import OptionTradeRequest
 
+# Load environment variables
 load_dotenv()
+
 router = APIRouter()
 
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-BASE_URL = "https://www.alphavantage.co/query"
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+if not POLYGON_API_KEY or POLYGON_API_KEY.strip() == "":
+    raise ValueError("POLYGON_API_KEY not set or is empty.")
 
-# Cache for stock quotes (5 minutes TTL)
-quote_cache = TTLCache(maxsize=100, ttl=300)
+print("Polygon API Key loaded:", POLYGON_API_KEY)  # Debug: Confirm key is loaded
 
-# Rate limiting
-last_request_time = datetime.now()
-MIN_REQUEST_INTERVAL = 12  
+BASE_POLYGON_URL = "https://api.polygon.io"
 
+# Cache setup
+quote_cache = TTLCache(maxsize=100, ttl=300)   
+market_cache = TTLCache(maxsize=10, ttl=300)  
+options_cache = TTLCache(maxsize=100, ttl=300)
 
+def get_polygon_headers():
+    return {
+        "Authorization": f"Bearer {POLYGON_API_KEY}"
+    }
+    
+@router.post("/options/trade")
+async def execute_option_trade(trade_data: OptionTradeRequest):
+    try:
+        # Verify user exists
+        user = users.find_one({"_id": ObjectId(trade_data.user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Calculate total cost (each contract is for 100 shares)
+        total_cost = float(trade_data.premium) * 100 * trade_data.quantity
+
+        # Get user's options and create position key
+        user_options = user.get("options", {})
+        position_key = f"options.{trade_data.symbol}-{trade_data.option_type}-{trade_data.strike}-{trade_data.expiration}"
+
+        if trade_data.trade_type == "BUY":
+            # Check if user has enough cash
+            if float(user.get("cash", 0)) < total_cost:
+                raise HTTPException(status_code=400, detail="Insufficient funds")
+
+            # Update user's cash and option position
+            result = users.update_one(
+                {"_id": ObjectId(trade_data.user_id)},
+                {
+                    "$inc": {
+                        "cash": -total_cost,
+                        position_key: trade_data.quantity
+                    }
+                }
+            )
+
+        else:  # SELL
+            # Check if user has enough contracts
+            current_position = float(user_options.get(f"{trade_data.symbol}-{trade_data.option_type}-{trade_data.strike}-{trade_data.expiration}", 0))
+            if current_position < float(trade_data.quantity):
+                raise HTTPException(status_code=400, detail="Insufficient contracts to sell")
+
+            # Update user's cash and option position
+            result = users.update_one(
+                {"_id": ObjectId(trade_data.user_id)},
+                {
+                    "$inc": {
+                        "cash": total_cost,
+                        position_key: -trade_data.quantity
+                    }
+                }
+            )
+
+        # Get updated portfolio
+        updated_user = users.find_one({"_id": ObjectId(trade_data.user_id)})
+        
+        # Format portfolio response
+        portfolio_response = {
+            "cash": float(updated_user.get("cash", 0)),
+            "positions": [],
+            "options": [],
+            "total_value": float(updated_user.get("cash", 0))
+        }
+
+        # Add stock positions
+        for symbol, qty in updated_user.get("portfolio", {}).items():
+            if float(qty) > 0:
+                portfolio_response["positions"].append({
+                    "symbol": symbol,
+                    "quantity": float(qty)
+                })
+
+        # Add options positions
+        for opt_key, qty in updated_user.get("options", {}).items():
+            if float(qty) > 0:
+                symbol, opt_type, strike, exp = opt_key.split("-")
+                option_position = {
+                    "symbol": symbol,
+                    "option_type": opt_type,
+                    "strike": float(strike),
+                    "expiration": exp,
+                    "quantity": float(qty)
+                }
+                portfolio_response["options"].append(option_position)
+
+        return portfolio_response
+
+    except Exception as e:
+        print(f"Error executing option trade: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+      
 async def get_portfolio(user_id: str):
     user = users.find_one({"_id": ObjectId(user_id)})
     if not user:
@@ -33,6 +129,7 @@ async def get_portfolio(user_id: str):
         "positions": [],
         "total_value": user.get("cash", 0)
     }
+
     for symbol, quantity in user.get("portfolio", {}).items():
         if quantity > 0:
             try:
@@ -47,473 +144,441 @@ async def get_portfolio(user_id: str):
                     "percentChange": quote["percentChange"]
                 })
                 portfolio_data["total_value"] += position_value
-            except:
+            except Exception as e:
+                print(f"Error fetching quote for {symbol}: {e}")
                 continue
                 
     return portfolio_data
-  
+
 @router.get("/portfolio/{user_id}")
 async def get_portfolio_route(user_id: str):
-  return await get_portfolio(user_id)
+    return await get_portfolio(user_id)
 
-def check_rate_limit():
-    global last_request_time
-    current_time = datetime.now()
-    time_since_last_request = (current_time - last_request_time).total_seconds()
-    
-    if time_since_last_request < MIN_REQUEST_INTERVAL:
-        sleep(MIN_REQUEST_INTERVAL - time_since_last_request)
-    
-    last_request_time = current_time
-
-async def validate_trade(trade_data: Dict, user_id: str):
-    """Validate trade data and check user permissions"""
-    if not all(key in trade_data for key in ["symbol", "type", "quantity", "price"]):
-        raise HTTPException(status_code=400, detail="Invalid trade data")
-        
-    if trade_data["quantity"] <= 0:
-        raise HTTPException(status_code=400, detail="Invalid quantity")
-        
-    if trade_data["price"] <= 0:
-        raise HTTPException(status_code=400, detail="Invalid price")
-        
-    if trade_data["type"] not in ["BUY", "SELL"]:
-        raise HTTPException(status_code=400, detail="Invalid trade type")
-    
-    # Verify stock exists
-    try:
-        await get_stock_quote(trade_data["symbol"])
-    except HTTPException:
-        raise HTTPException(status_code=400, detail="Invalid stock symbol")
 
 @router.get("/quote/{symbol}")
 async def get_stock_quote(symbol: str):
+    # Check cache first
+    if symbol in quote_cache:
+        return quote_cache[symbol]
+
     try:
-        # Check cache first
-        if symbol in quote_cache:
-            return quote_cache[symbol]
-        
-        check_rate_limit()
-        
+        # Polygon previous day's aggregates endpoint:
+        # GET /v2/aggs/ticker/{symbol}/prev?adjusted=true
+        url = f"{BASE_POLYGON_URL}/v2/aggs/ticker/{symbol.upper()}/prev"
         params = {
-            "function": "GLOBAL_QUOTE",
-            "symbol": symbol,
-            "apikey": ALPHA_VANTAGE_API_KEY
+            "adjusted": "true"
         }
-        
-        response = requests.get(BASE_URL, params=params)
-        response.raise_for_status()  # This will raise an exception for error status codes
-        
+        response = requests.get(url, headers=get_polygon_headers(), params=params)
+
+        # Handle no data scenario (404 or empty results)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="No data found for this symbol.")
+
+        response.raise_for_status()
         data = response.json()
-        
-        if "Note" in data:  # Alpha Vantage rate limit message
-            # Return mock data instead of error for demo purposes
-            return generate_mock_quote(symbol)
-            
-        if "Error Message" in data or "Global Quote" not in data:
-            return generate_mock_quote(symbol)
-            
-        quote = data["Global Quote"]
+
+        results = data.get("results", [])
+        if not results:
+            # No results returned
+            raise HTTPException(status_code=404, detail="No previous trading day data found.")
+
+        # The endpoint returns an array of one aggregate bar representing the previous trading day
+        bar = results[0]  # bar includes o, c, h, l, etc.
+        open_price = bar.get("o", 0)
+        close_price = bar.get("c", 0)
+        high_price = bar.get("h", 0)
+        low_price = bar.get("l", 0)
+
+        if open_price == 0:
+            # If open_price is zero, avoid division by zero in percentChange
+            raise HTTPException(status_code=500, detail="Invalid data: open price is zero.")
+
+        change = close_price - open_price
+        percentChange = (change / open_price) * 100
+
         result = {
-            "symbol": symbol,
-            "price": float(quote["05. price"]),
-            "change": float(quote["09. change"]),
-            "percentChange": float(quote["10. change percent"].strip('%')),
-            "high": float(quote["03. high"]),
-            "low": float(quote["04. low"]),
-            "volume": int(quote["06. volume"]),
-            "latest_trading_day": quote["07. latest trading day"]
+            "symbol": symbol.upper(),
+            "price": float(close_price),
+            "change": float(change),
+            "percentChange": float(percentChange),
+            "high": float(high_price),
+            "low": float(low_price),
+            "open": float(open_price),
+            "previousClose": float(open_price),  # Using open as a stand-in for previousClose
+            "name": symbol.upper(),
+            "currency": "USD",
+            "marketCap": 0  # Not provided by this endpoint
         }
-        
-        # Cache the result
+
         quote_cache[symbol] = result
         return result
-        
-    except requests.RequestException as e:
-        # Return mock data instead of error
-        return generate_mock_quote(symbol)
+
+    except requests.HTTPError as e:
+        print(f"Polygon API Error for quote: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch quote data: {str(e)}"
+        )
     except Exception as e:
-        # Return mock data instead of error
-        return generate_mock_quote(symbol)
+        print(f"Unexpected Error in quote: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
 
-def generate_mock_quote(symbol: str):
-    """Generate mock quote data for demo purposes"""
-    import random
-    base_price = 100.0
-    change = random.uniform(-5, 5)
-    price = base_price + change
-    return {
-        "symbol": symbol,
-        "price": round(price, 2),
-        "change": round(change, 2),
-        "percentChange": round((change / base_price) * 100, 2),
-        "high": round(price + random.uniform(0, 5), 2),
-        "low": round(price - random.uniform(0, 5), 2),
-        "volume": random.randint(100000, 1000000),
-        "latest_trading_day": datetime.now().strftime("%Y-%m-%d")
-    }
-    
-@router.post("/trade")
-async def execute_trade(trade_data: dict, user_id: str):
-    await validate_trade(trade_data, user_id)
-    
-    user = users.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
 
-    # Get current price to verify trade price is reasonable
-    current_quote = await get_stock_quote(trade_data["symbol"])
-    price_difference = abs(current_quote["price"] - trade_data["price"]) / current_quote["price"]
-    if price_difference > 0.05:  # 5% difference
-        raise HTTPException(status_code=400, detail="Trade price too far from market price")
 
-    total = trade_data["quantity"] * trade_data["price"]
+@router.get("/historical/{symbol}")
+async def get_historical_data(symbol: str, timeframe: str = "1D"):
+    now = datetime.utcnow()
+    if timeframe == "1D":
+        from_dt = now - timedelta(days=1)
+        multiplier = 15   # 15-minute bars for intraday
+        timespan = "minute"
+    elif timeframe == "1W":
+        from_dt = now - timedelta(days=7)
+        multiplier = 1
+        timespan = "day"
+    elif timeframe == "1M":
+        from_dt = now - timedelta(days=30)
+        multiplier = 1
+        timespan = "day"
+    elif timeframe == "3M":
+        from_dt = now - timedelta(days=90)
+        multiplier = 1
+        timespan = "day"
+    elif timeframe == "6M":
+        from_dt = now - timedelta(days=180)
+        multiplier = 1
+        timespan = "day"
+    elif timeframe == "1Y":
+        from_dt = now - timedelta(days=365)
+        multiplier = 1
+        timespan = "week"
+    else:
+        from_dt = now - timedelta(days=1)
+        multiplier = 15
+        timespan = "minute"
+
+    from_str = from_dt.strftime('%Y-%m-%d')
+    to_str = now.strftime('%Y-%m-%d')
+
+    url = f"{BASE_POLYGON_URL}/v2/aggs/ticker/{symbol.upper()}/range/{multiplier}/{timespan}/{from_str}/{to_str}"
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
 
     try:
-        if trade_data["type"] == "BUY":
-            if user["cash"] < total:
+        response = requests.get(url, headers=get_polygon_headers(), params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("resultsCount", 0) == 0:
+            return {
+                "symbol": symbol.upper(),
+                "timeframe": timeframe,
+                "labels": [],
+                "prices": []
+            }
+
+        results = data.get("results", [])
+        labels = []
+        prices = []
+
+        for r in results:
+            ts = r["t"] / 1000
+            dt = datetime.utcfromtimestamp(ts)
+            close_price = r["c"]
+            if timespan in ["minute", "hour"]:
+                labels.append(dt.strftime('%Y-%m-%d %H:%M'))
+            else:
+                labels.append(dt.strftime('%Y-%m-%d'))
+            prices.append(close_price)
+
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "labels": labels,
+            "prices": prices
+        }
+
+    except requests.HTTPError as e:
+        print(f"Polygon API Error for historical: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch historical data: {str(e)}"
+        )
+    except Exception as e:
+        print(f"Unexpected Error in historical: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+@router.get("/options/{symbol}")
+async def get_options_chain(symbol: str):
+    try:
+        # Get the base stock price from your existing quote endpoint
+        stock_price = 100  # Default price if none found
+        strike_range = [-10, -5, -2, 2, 5, 10]  # Strike price differences
+        
+        # Generate expiration dates (next 4 fridays)
+        expirations = []
+        current_date = datetime.now()
+        for _ in range(4):
+            days_until_friday = (4 - current_date.weekday()) % 7
+            if days_until_friday == 0:
+                days_until_friday = 7
+            current_date += timedelta(days=days_until_friday)
+            expirations.append(current_date.strftime("%Y-%m-%d"))
+
+        calls = []
+        puts = []
+
+        for exp in expirations:
+            for strike_diff in strike_range:
+                strike = round(stock_price + strike_diff, 2)
+                
+                # Calculate call premium
+                call_intrinsic = max(0, stock_price - strike)
+                call_premium = round(call_intrinsic + random.uniform(0.5, 2.0), 2)
+                
+                calls.append({
+                    "strike": strike,
+                    "premium": call_premium,
+                    "expiration": exp,
+                    "type": "CALL"
+                })
+
+                # Calculate put premium
+                put_intrinsic = max(0, strike - stock_price)
+                put_premium = round(put_intrinsic + random.uniform(0.5, 2.0), 2)
+                
+                puts.append({
+                    "strike": strike,
+                    "premium": put_premium,
+                    "expiration": exp,
+                    "type": "PUT"
+                })
+
+        return {
+            "calls": calls,
+            "puts": puts,
+            "underlying_price": stock_price
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+      
+      
+@router.post("/trade")
+async def execute_option_trade(
+    user_id: str,
+    symbol: str,
+    option_type: Literal["CALL", "PUT"],
+    strike: float,
+    premium: float,
+    expiration: str,
+    trade_type: Literal["BUY", "SELL"],
+    quantity: int
+):
+    try:
+        # Verify user exists
+        user = users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Calculate total cost (each contract is for 100 shares)
+        total_cost = premium * 100 * quantity
+
+        # Get user's options and create position key
+        user_options = user.get("options", {})
+        position_key = f"{symbol}-{option_type}-{strike}-{expiration}"
+
+        if trade_type == "BUY":
+            # Check if user has enough cash
+            if user["cash"] < total_cost:
                 raise HTTPException(status_code=400, detail="Insufficient funds")
-            
-            users.update_one(
+
+            # Update user's cash and option position
+            result = users.update_one(
                 {"_id": ObjectId(user_id)},
                 {
                     "$inc": {
-                        "cash": -total,
-                        f"portfolio.{trade_data['symbol']}": trade_data["quantity"]
+                        "cash": -total_cost,
+                        f"options.{position_key}": quantity
                     }
                 }
             )
+
         else:  # SELL
-            current_quantity = user["portfolio"].get(trade_data["symbol"], 0)
-            if current_quantity < trade_data["quantity"]:
-                raise HTTPException(status_code=400, detail="Insufficient shares")
-            
-            users.update_one(
+            # Check if user has enough contracts
+            current_position = user_options.get(position_key, 0)
+            if current_position < quantity:
+                raise HTTPException(status_code=400, detail="Insufficient contracts to sell")
+
+            # Update user's cash and option position
+            result = users.update_one(
                 {"_id": ObjectId(user_id)},
                 {
                     "$inc": {
-                        "cash": total,
-                        f"portfolio.{trade_data['symbol']}": -trade_data["quantity"]
+                        "cash": total_cost,
+                        f"options.{position_key}": -quantity
                     }
                 }
             )
 
         # Record the trade
-        trade_doc = {
+        trade_record = {
             "user_id": ObjectId(user_id),
-            **trade_data,
-            "total": total,
-            "market_price": current_quote["price"],
+            "symbol": symbol,
+            "option_type": option_type,
+            "strike": strike,
+            "premium": premium,
+            "expiration": expiration,
+            "trade_type": trade_type,
+            "quantity": quantity,
+            "total_cost": total_cost,
             "timestamp": datetime.utcnow()
         }
-        trades.insert_one(trade_doc)
-        
-        # Return updated portfolio
-        return await get_portfolio(user_id)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
+        trades.insert_one(trade_record)
 
-@router.get("/performance/{user_id}")
-async def get_performance_metrics(user_id: str, timeframe: str = "1M"):
-    user = users.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        # Get updated portfolio
+        updated_user = users.find_one({"_id": ObjectId(user_id)})
         
-    user_trades = list(trades.find({"user_id": ObjectId(user_id)}))
-    
-    total_invested = sum(trade["total"] for trade in user_trades if trade["type"] == "BUY")
-    total_sold = sum(trade["total"] for trade in user_trades if trade["type"] == "SELL")
-    
-    portfolio_value = user["cash"]
-    for symbol, quantity in user.get("portfolio", {}).items():
-        if quantity > 0:
-            try:
-                quote = await get_stock_quote(symbol)
-                portfolio_value += quantity * quote["price"]
-            except:
-                continue
-    
-    return {
-        "portfolio": [portfolio_value],  
-        "benchmark": [total_invested],   
-        "labels": ["Current"],
-        "metrics": {
-            "total_invested": total_invested,
-            "total_sold": total_sold,
-            "current_value": portfolio_value,
-            "profit_loss": portfolio_value - total_invested,
-            "return_percentage": ((portfolio_value - total_invested) / total_invested * 100) if total_invested > 0 else 0
+        # Format portfolio response
+        portfolio_response = {
+            "cash": updated_user.get("cash", 0),
+            "positions": [],
+            "options": [],
+            "total_value": updated_user.get("cash", 0)
         }
-    }
+
+        # Add stock positions
+        for symbol, qty in updated_user.get("portfolio", {}).items():
+            if qty > 0:
+                portfolio_response["positions"].append({
+                    "symbol": symbol,
+                    "quantity": qty
+                })
+
+        # Add options positions
+        for opt_key, qty in updated_user.get("options", {}).items():
+            if qty > 0:
+                symbol, opt_type, strike, exp = opt_key.split("-")
+                option_position = {
+                    "symbol": symbol,
+                    "option_type": opt_type,
+                    "strike": float(strike),
+                    "expiration": exp,
+                    "quantity": qty
+                }
+                portfolio_response["options"].append(option_position)
+
+        return portfolio_response
+
+    except Exception as e:
+        print(f"Trade execution error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/market/overview")
 async def get_market_overview():
-    """Get market overview including indices, top movers, and sector performance"""
-    cache_key = "market_overview"
-    
-    if cache_key in market_cache:
-        return market_cache[cache_key]
-        
     try:
-        # Get top gainers and losers from trades collection
-        pipeline = [
-            {"$match": {
-                "timestamp": {"$gte": datetime.now() - timedelta(days=1)}
-            }},
-            {"$group": {
-                "_id": "$symbol",
-                "last_price": {"$last": "$market_price"},
-                "first_price": {"$first": "$market_price"},
-                "volume": {"$sum": "$quantity"}
-            }},
-            {"$project": {
-                "symbol": "$_id",
-                "price_change": {"$subtract": ["$last_price", "$first_price"]},
-                "price_change_percent": {
-                    "$multiply": [
-                        {"$divide": [
-                            {"$subtract": ["$last_price", "$first_price"]},
-                            "$first_price"
-                        ]},
-                        100
-                    ]
-                },
-                "volume": 1
-            }},
-            {"$sort": {"price_change_percent": -1}},
-            {"$limit": 10}
-        ]
-        
-        top_gainers = list(trades.aggregate(pipeline))
-        
-        # Reverse sort for losers
-        pipeline[-2] = {"$sort": {"price_change_percent": 1}}
-        top_losers = list(trades.aggregate(pipeline))
-        
-        # Get most active stocks
-        pipeline[-2] = {"$sort": {"volume": -1}}
-        most_active = list(trades.aggregate(pipeline))
-        
+        cache_key = "market_overview"
+        if cache_key in market_cache:
+            return market_cache[cache_key]
+
+        status_response = requests.get(f"{BASE_POLYGON_URL}/v1/marketstatus/now", headers=get_polygon_headers())
+        status_response.raise_for_status()
+        status_data = status_response.json()
+
+        market_is_open = status_data.get("market", "closed") == "open"
+
+        end = datetime.utcnow()
+        start = end - timedelta(days=2)
+        s_url = f"{BASE_POLYGON_URL}/v2/aggs/ticker/INX/range/1/day/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
+        s_resp = requests.get(s_url, headers=get_polygon_headers())
+        s_resp.raise_for_status()
+        s_data = s_resp.json()
+        sp_value = 0.0
+        sp_change_percent = 0.0
+        if s_data.get("resultsCount", 0) > 0:
+            results = s_data["results"]
+            sp_value = results[-1]["c"]
+            if len(results) > 1:
+                prev_close = results[-2]["c"]
+                sp_change_percent = ((sp_value - prev_close) / prev_close) * 100 if prev_close else 0.0
+
+        news_url = f"{BASE_POLYGON_URL}/v2/reference/news"
+        news_params = {"limit": 5}
+        news_resp = requests.get(news_url, headers=get_polygon_headers(), params=news_params)
+        news_resp.raise_for_status()
+        news_data = news_resp.json()
+        news_items = news_data.get("results", [])[:5]
+
         overview = {
-            "timestamp": datetime.now(),
-            "market_stats": {
-                "total_trades": trades.count_documents({
-                    "timestamp": {"$gte": datetime.now() - timedelta(days=1)}
-                }),
-                "total_volume": sum(stock["volume"] for stock in most_active),
-                "unique_symbols": len(set(trade["symbol"] for trade in most_active))
+            "market_status": "Open" if market_is_open else "Closed",
+            "sp500": {
+                "value": float(sp_value),
+                "changePercent": float(sp_change_percent)
             },
-            "top_gainers": top_gainers,
-            "top_losers": top_losers,
-            "most_active": most_active
+            "tradingVolume": None,
+            "market_news": news_items
         }
-        
+
         market_cache[cache_key] = overview
         return overview
-        
+
+    except requests.HTTPError as e:
+        print(f"Polygon API Error for market overview: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch market overview: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Unexpected Error in market overview: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
 
 @router.get("/search")
-async def search_stocks(
-    query: str = Query(..., min_length=1),
-    limit: int = Query(default=10, le=50)
-):
-    """Search for stocks by symbol or recent trading activity"""
+async def search_stocks(query: str = Query(..., min_length=1)):
     try:
-        # Search in recent trades for matching symbols
-        pipeline = [
-            {"$match": {
-                "symbol": {"$regex": query.upper(), "$options": "i"}
-            }},
-            {"$sort": {"timestamp": -1}},
-            {"$group": {
-                "_id": "$symbol",
-                "last_trade": {"$first": "$market_price"},
-                "volume": {"$sum": "$quantity"}
-            }},
-            {"$limit": limit}
-        ]
+        # Using Polygon.io's Ticker Search endpoint
+        search_url = f"{BASE_POLYGON_URL}/v3/reference/tickers"
+        search_params = {
+            "search": query,
+            "active": "true",
+            "market": "stocks",  # Only search for stocks
+            "limit": 10,
+            "sort": "ticker"     # Sort by ticker symbol
+        }
         
-        results = list(trades.aggregate(pipeline))
-        
+        headers = get_polygon_headers()
+        resp = requests.get(search_url, headers=headers, params=search_params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Process and format the results
+        results = []
+        for item in data.get("results", []):
+            # Only include stocks (exclude ETFs, mutual funds, etc. if desired)
+            if item.get("type") == "CS":  # Common Stock
+                results.append({
+                    "symbol": item["ticker"],
+                    "name": item.get("name", ""),
+                    "type": "Stock"
+                })
+
         return {
             "results": results,
             "count": len(results)
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/trades/history/{user_id}")
-async def get_trade_history(
-    user_id: str,
-    start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
-    limit: int = Query(default=50, le=100)
-):
-    """Get user's trading history with optional date filtering"""
-    try:
-        query = {"user_id": ObjectId(user_id)}
-        
-        if start_date:
-            query["timestamp"] = {"$gte": start_date}
-        if end_date:
-            query["timestamp"] = {"$lte": end_date}
-            
-        trades_history = list(trades.find(
-            query,
-            {"_id": 0}
-        ).sort("timestamp", -1).limit(limit))
-        
-        return trades_history
-        
+    except requests.HTTPError as e:
+        print(f"Polygon API Error for search: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to search stocks: {str(e)}"
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/portfolio/analysis/{user_id}")
-async def get_portfolio_analysis(user_id: str):
-    """Get detailed portfolio analysis including diversity and performance metrics"""
-    try:
-        user = users.find_one({"_id": ObjectId(user_id)})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-            
-        portfolio = user.get("portfolio", {})
-        if not portfolio:
-            return {
-                "diversity_score": 0,
-                "total_value": user.get("cash", 0),
-                "performance": {
-                    "daily": 0,
-                    "weekly": 0,
-                    "monthly": 0
-                },
-                "positions": []
-            }
-            
-        # Calculate portfolio metrics
-        positions = []
-        total_value = user.get("cash", 0)
-        
-        for symbol, quantity in portfolio.items():
-            # Get recent trades for this symbol
-            recent_trades = list(trades.find(
-                {"symbol": symbol},
-                {"market_price": 1, "timestamp": 1}
-            ).sort("timestamp", -1).limit(1))
-            
-            if recent_trades:
-                current_price = recent_trades[0]["market_price"]
-                position_value = quantity * current_price
-                total_value += position_value
-                
-                positions.append({
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "current_price": current_price,
-                    "position_value": position_value,
-                    "weight": position_value / total_value
-                })
-        
-        # Calculate diversity score (Herfindahl-Hirschman Index)
-        diversity_score = 1 - sum(pos["weight"] ** 2 for pos in positions)
-        
-        # Calculate performance metrics
-        time_periods = {
-            "daily": timedelta(days=1),
-            "weekly": timedelta(days=7),
-            "monthly": timedelta(days=30)
-        }
-        
-        performance = {}
-        for period_name, delta in time_periods.items():
-            start_date = datetime.now() - delta
-            period_trades = trades.find({
-                "user_id": ObjectId(user_id),
-                "timestamp": {"$gte": start_date}
-            })
-            
-            period_pl = sum(
-                trade["quantity"] * (
-                    trade["market_price"] - trade["price"]
-                ) for trade in period_trades
-            )
-            
-            performance[period_name] = period_pl
-        
-        return {
-            "diversity_score": diversity_score,
-            "total_value": total_value,
-            "cash_ratio": user.get("cash", 0) / total_value,
-            "positions": positions,
-            "performance": performance
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-      
-        
-@router.post("/trade")
-async def execute_trade(trade_data: dict, user_id: str):
-    try:
-        # Validate trade data
-        if not all(key in trade_data for key in ["symbol", "type", "quantity", "price"]):
-            raise HTTPException(status_code=400, detail="Invalid trade data")
-            
-        user = users.find_one({"_id": ObjectId(user_id)})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-            
-        total = trade_data["quantity"] * trade_data["price"]
-        
-        if trade_data["type"] == "BUY":
-            if user["cash"] < total:
-                raise HTTPException(status_code=400, detail="Insufficient funds")
-            
-            users.update_one(
-                {"_id": ObjectId(user_id)},
-                {
-                    "$inc": {
-                        "cash": -total,
-                        f"portfolio.{trade_data['symbol']}": trade_data["quantity"]
-                    }
-                }
-            )
-        else:  # SELL
-            current_quantity = user["portfolio"].get(trade_data["symbol"], 0)
-            if current_quantity < trade_data["quantity"]:
-                raise HTTPException(status_code=400, detail="Insufficient shares")
-            
-            users.update_one(
-                {"_id": ObjectId(user_id)},
-                {
-                    "$inc": {
-                        "cash": total,
-                        f"portfolio.{trade_data['symbol']}": -trade_data["quantity"]
-                    }
-                }
-            )
-            
-        # Record the trade
-        trade_doc = {
-            "user_id": ObjectId(user_id),
-            **trade_data,
-            "timestamp": datetime.utcnow()
-        }
-        trades.insert_one(trade_doc)
-        
-        # Return updated portfolio
-        return await get_portfolio(user_id)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/watchlist/{userId}")
-async def get_watchlist(user_id: str):
-  user = users.find_one({"_id" : ObjectId(user_id)})
-  if not user:
-      raise HTTPException(status_code=404, detail="Invalid User/Watchlist")
-  user_watchlist = user.get("watchlist", [])
-  return user_watchlist
+        print(f"Unexpected Error in search: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
