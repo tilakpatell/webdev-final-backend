@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from backend_files.services.chatbot import ChatGPT
-from backend_files.schemas import ChatRequest
+from services.chatbot import ChatGPT
+from schemas import ChatRequest
 
 router = APIRouter()
 chatgpt = ChatGPT()
