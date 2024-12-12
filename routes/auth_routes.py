@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response, Request
 from fastapi.responses import JSONResponse
 from database import users
 from schemas import UserLogin, UserSignup
@@ -24,11 +24,12 @@ async def get_profile(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/signout")
-def signout():
+def signout(response: Response):
+    response.delete_cookie("session_token")
     return {"status": "success"}
 
 @router.post("/signin")
-async def login(user_data: UserLogin):
+async def login(user_data: UserLogin, response: Response):
     try:
         user = users.find_one({"username": user_data.username})
         if not user:
@@ -38,13 +39,41 @@ async def login(user_data: UserLogin):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
         user["_id"] = str(user["_id"])
-        user.pop("password", None)  # Remove password from response
+        user.pop("password", None)
+        
+        # Set secure cookie with user session
+        response.set_cookie(
+            key="session_token",
+            value=str(user["_id"]),
+            httponly=True,
+            secure=False,  # Set to True in production with HTTPS
+            samesite="lax",
+            max_age=24 * 60 * 60  # 24 hours
+        )
         
         return user
         
     except Exception as e:
         print(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/check-session")
+async def check_session(request: Request):
+    try:
+        session_token = request.cookies.get("session_token")
+        if not session_token:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+            
+        user = users.find_one({"_id": ObjectId(session_token)})
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid session")
+            
+        user["_id"] = str(user["_id"])
+        user.pop("password", None)
+        return user
+        
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Session invalid")
 
 @router.post("/signup")
 async def signup(user_data: UserSignup):
