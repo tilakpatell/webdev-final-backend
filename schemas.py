@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from datetime import datetime
 from typing import List, Dict, Literal, Optional
 
@@ -14,6 +14,7 @@ class UserSignup(BaseModel):
     lastName: str
     dob: str
     socialsecurity: str
+    profile_picture: Optional[str] = "https://img.daisyui.com/images/stock/photo-1534528741775-53994a69daeb.webp"
 
 class StockQuote(BaseModel):
     symbol: str
@@ -104,3 +105,6 @@ class StockTrade(BaseModel):
     type: str  
     quantity: int
     price: float
+
+class ProfilePictureUpdate(BaseModel):
+    profile_picture: HttpUrl

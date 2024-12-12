@@ -14,6 +14,7 @@ load_dotenv()
 class ChatGPT:
     def __init__(self):
         api_key = os.getenv("ANTHROPIC_API_KEY")
+        print(api_key)
         if not api_key:
             logger.error("Anthropic API key not found in environment variables")
             raise ValueError("Anthropic API key not configured")

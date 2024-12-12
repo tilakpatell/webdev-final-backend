@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException, Response, Request
 from ..database import users
-from ..schemas import UserLogin, UserSignup
+from ..schemas import UserLogin, UserSignup, ProfilePictureUpdate
 from bson import ObjectId
-
+from fastapi import File, UploadFile, Form
+from typing import Optional
+import aiofiles
+from pathlib import Path
+import os
+from datetime import datetime
 
 router = APIRouter()
 
@@ -80,6 +85,7 @@ async def signup(user_data: UserSignup):
         if users.find_one({"username": user_data.username}):
             raise HTTPException(status_code=400, detail="Username already exists")
         
+            
         default_goals = [
             {
                 "id": "1",
@@ -118,11 +124,16 @@ async def signup(user_data: UserSignup):
         user_doc["watchlist"] = []
         user_doc["goals"] = default_goals
         
+        if "profile_picture" not in user_doc or not user_doc["profile_picture"]:
+          user_doc["profile_picture"] = "https://img.daisyui.com/images/stock/photo-1534528741775-53994a69daeb.webp"
+        
         result = users.insert_one(user_doc)
         
         new_user = users.find_one({"_id": result.inserted_id})
         new_user["_id"] = str(new_user["_id"])
         new_user.pop("password", None)
+        
+        
         
         return new_user
         
@@ -220,4 +231,84 @@ async def update_goals(user_id: str, data: dict):
         return {"message": "Goals updated successfully"}
     except Exception as e:
         print(f"Error updating goals: {str(e)}")  # Debug log
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/profile/{user_id}")
+async def update_profile(user_id: str, updated_data: dict):
+    try:
+        # Remove any fields that shouldn't be updated
+        if "password" in updated_data:
+            del updated_data["password"]
+        if "_id" in updated_data:
+            del updated_data["_id"]
+            
+        # Update the user document
+        result = users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": updated_data}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        # Return updated user data
+        user = users.find_one({"_id": ObjectId(user_id)})
+        user["_id"] = str(user["_id"])
+        user.pop("password", None)
+        
+        return user
+        
+    except Exception as e:
+        print(f"Profile update error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/users")
+async def get_users(skip: int = 0, limit: int = 20, search: str = None):
+    try:
+        query = {}
+        if search:
+            query = {
+                "$or": [
+                    {"username": {"$regex": search, "$options": "i"}},
+                    {"firstName": {"$regex": search, "$options": "i"}},
+                    {"lastName": {"$regex": search, "$options": "i"}}
+                ]
+            }
+        
+        total = users.count_documents(query)
+        user_list = users.find(query).skip(skip).limit(limit)
+        
+        # Format users for response
+        formatted_users = []
+        for user in user_list:
+            user["_id"] = str(user["_id"])
+            user.pop("password", None)
+            formatted_users.append(user)
+            
+        return {
+            "users": formatted_users,
+            "total": total
+        }
+        
+    except Exception as e:
+        print(f"Error fetching users: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@router.put("/profile/{user_id}/update-picture")
+async def update_profile_picture(user_id: str, data: ProfilePictureUpdate):
+    try:
+        result = users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"profile_picture": str(data.profile_picture)}}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        return {"message": "Profile picture updated successfully"}
+        
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
